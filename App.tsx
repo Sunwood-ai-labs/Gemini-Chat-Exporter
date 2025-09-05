@@ -5,6 +5,9 @@ import { MessageBubble } from './components/MessageBubble';
 import { SendIcon, DownloadIcon, SettingsIcon, CloseIcon, CopyIcon, GoogleIcon } from './components/icons';
 import { type ChatMessage, MessageSender, type GoogleUserProfile } from './types';
 
+// Prefer Client ID from Vite env (exposed via vite.config.ts)
+const ENV_GOOGLE_CLIENT_ID: string = (process.env.GOOGLE_CLIENT_ID as unknown as string) || '';
+
 // START: SettingsModal Component
 interface SettingsModalProps {
   isOpen: boolean;
@@ -17,12 +20,14 @@ interface SettingsModalProps {
   authError: string | null;
   handleSignIn: () => void;
   handleSignOut: () => void;
+  isEnvConfigured: boolean;
 }
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ 
     isOpen, onClose, clientId, onSave,
     isAuthInitialized, isSignedIn, user, authError,
-    handleSignIn, handleSignOut 
+    handleSignIn, handleSignOut,
+    isEnvConfigured
 }) => {
   const [localClientId, setLocalClientId] = useState(clientId);
   const [origin, setOrigin] = useState('');
@@ -87,17 +92,22 @@ const SettingsModal: React.FC<SettingsModalProps> = ({
                         value={localClientId}
                         onChange={(e) => setLocalClientId(e.target.value)}
                         placeholder="Enter your Google Client ID"
-                        className="flex-grow bg-slate-700 text-slate-200 border border-slate-600 rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-shadow"
+                        className="flex-grow bg-slate-700 text-slate-200 border border-slate-600 rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-shadow disabled:opacity-70"
+                        disabled={isEnvConfigured}
+                        readOnly={isEnvConfigured}
                     />
                     <button
                         onClick={handleSave}
-                        className="px-6 py-3 bg-gradient-to-br from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 rounded-lg text-white font-semibold transition-all duration-200 transform hover:scale-105 shadow-lg"
+                        className="px-6 py-3 bg-gradient-to-br from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 rounded-lg text-white font-semibold transition-all duration-200 transform hover:scale-105 shadow-lg disabled:opacity-60 disabled:cursor-not-allowed"
+                        disabled={isEnvConfigured}
                     >
                         Save
                     </button>
                 </div>
                 <p className="text-xs text-slate-400 mt-2">
-                    Used for Google integrations like exporting to Google Sheets.
+                    {isEnvConfigured
+                      ? 'Client ID is configured via environment variables and cannot be edited here.'
+                      : 'Used for Google integrations like exporting to Google Sheets.'}
                 </p>
             </div>
 
@@ -242,21 +252,27 @@ const App: React.FC = () => {
   const { messages, isLoading, error, sendMessage } = useChat();
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
-  const [googleClientId, setGoogleClientId] = useState<string>('');
+  const [googleClientId, setGoogleClientId] = useState<string>(ENV_GOOGLE_CLIENT_ID || '');
+  const [isExportingSheets, setIsExportingSheets] = useState(false);
+  const [sheetsStatus, setSheetsStatus] = useState<string | null>(null);
   
   const { 
     isInitialized: isAuthInitialized, 
     isSignedIn, 
     user, 
     error: authError, 
+    accessToken,
     handleSignIn, 
     handleSignOut 
   } = useGoogleAuth(googleClientId);
 
   useEffect(() => {
-    const savedClientId = localStorage.getItem('googleClientId');
-    if (savedClientId) {
-      setGoogleClientId(savedClientId);
+    // Prefer env-provided Client ID; fallback to saved one only if env is not set
+    if (!ENV_GOOGLE_CLIENT_ID) {
+      const savedClientId = localStorage.getItem('googleClientId');
+      if (savedClientId) {
+        setGoogleClientId(savedClientId);
+      }
     }
   }, []);
 
@@ -289,8 +305,8 @@ const App: React.FC = () => {
     };
 
     const headers = ["Sender", "Message"];
-    // Filter out the initial placeholder message if it's the only one from the model
-    const rows = messages.filter(msg => msg.id !== `gemini-initial-${Date.now()}`).map(msg => [
+    // Filter out the initial placeholder message
+    const rows = messages.filter(msg => !(msg.sender === MessageSender.MODEL && msg.id.startsWith('gemini-initial-'))).map(msg => [
       msg.sender === MessageSender.USER ? 'User' : 'Gemini',
       escapeCsvField(msg.text)
     ]);
@@ -310,32 +326,155 @@ const App: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
+  const exportToGoogleSheets = async () => {
+    try {
+      setSheetsStatus(null);
+      if (messages.length <= 1) {
+        setSheetsStatus('エクスポートする会話がありません。');
+        return;
+      }
+      if (!isSignedIn || !accessToken) {
+        setSheetsStatus('Googleアカウントに接続してください。設定から接続可能です。');
+        setIsSettingsOpen(true);
+        return;
+      }
+
+      setIsExportingSheets(true);
+
+      const filtered = messages.filter(m => !(m.sender === MessageSender.MODEL && m.id.startsWith('gemini-initial-')));
+      if (filtered.length === 0) {
+        setSheetsStatus('エクスポートする会話がありません。');
+        setIsExportingSheets(false);
+        return;
+      }
+
+      const timestamp = new Date().toLocaleString();
+      const values = filtered.map(m => [timestamp, m.sender === MessageSender.USER ? 'User' : 'Gemini', m.text]);
+
+      const lsKey = `sheets.spreadsheetId.${user?.email ?? 'default'}`;
+      let spreadsheetId = localStorage.getItem(lsKey);
+
+      const authHeaders = {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      } as const;
+
+      if (!spreadsheetId) {
+        // Create spreadsheet with a default sheet named "Conversations"
+        const createRes = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({
+            properties: { title: 'Gemini Sheets Exporter' },
+            sheets: [{ properties: { title: 'Conversations' } }],
+          }),
+        });
+        if (createRes.status === 401) {
+          setSheetsStatus('認証が無効です。再接続してください。');
+          setIsExportingSheets(false);
+          return;
+        }
+        if (!createRes.ok) {
+          const errText = await createRes.text().catch(() => '');
+          throw new Error(`スプレッドシートの作成に失敗しました: ${errText || createRes.statusText}`);
+        }
+        const created = await createRes.json();
+        spreadsheetId = created.spreadsheetId as string;
+        localStorage.setItem(lsKey, spreadsheetId);
+
+        // Write header row
+        const headerRes = await fetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent('Conversations!A1:C1')}?valueInputOption=RAW`,
+          {
+            method: 'PUT',
+            headers: authHeaders,
+            body: JSON.stringify({ values: [[ 'Timestamp', 'Sender', 'Message' ]] }),
+          }
+        );
+        if (!headerRes.ok) {
+          // Non-fatal; continue but inform user
+          console.warn('Failed to write header row');
+        }
+      }
+
+      // Append rows
+      const appendUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent('Conversations!A:C')}:append?valueInputOption=USER_ENTERED`;
+      const appendRes = await fetch(appendUrl, {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ values }),
+      });
+      if (appendRes.status === 401) {
+        setSheetsStatus('認証が無効です。再接続してください。');
+        setIsExportingSheets(false);
+        return;
+      }
+      if (!appendRes.ok) {
+        const errText = await appendRes.text().catch(() => '');
+        throw new Error(`エクスポートに失敗しました: ${errText || appendRes.statusText}`);
+      }
+
+      const openUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}`;
+      setSheetsStatus('エクスポートが完了しました。スプレッドシートを開きます。');
+      window.open(openUrl, '_blank', 'noopener');
+    } catch (e: any) {
+      console.error(e);
+      setSheetsStatus(e?.message || 'エクスポート中にエラーが発生しました。');
+    } finally {
+      setIsExportingSheets(false);
+      // Auto-clear status after a short delay
+      setTimeout(() => setSheetsStatus(null), 4000);
+    }
+  };
+
 
   return (
-    <div className="flex flex-col h-screen bg-slate-900 text-slate-200 font-sans">
-      <header className="flex items-center justify-between p-4 bg-slate-800/70 backdrop-blur-sm border-b border-slate-700 shadow-md z-10">
-        <h1 className="text-xl font-bold text-slate-100">Gemini Chat Exporter</h1>
-        <div className="flex items-center gap-4">
-            <button 
-                onClick={exportToCsv}
-                className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-white font-semibold transition-colors duration-200 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed"
-                disabled={messages.length <= 1}
-            >
-                <DownloadIcon className="w-5 h-5" />
-                Export to CSV
-            </button>
-            <button
-                onClick={() => setIsSettingsOpen(true)}
-                className="p-2 rounded-full text-slate-300 hover:bg-slate-700 hover:text-white transition-colors"
-                aria-label="Open settings"
-            >
-                <SettingsIcon className="w-6 h-6" />
-            </button>
+    <div className="flex flex-col h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 text-slate-200 font-sans">
+      <header className="flex items-center justify-between p-4 bg-slate-800/60 backdrop-blur-xl border-b border-slate-700/70 shadow-[0_10px_30px_-10px_rgba(0,0,0,0.6)] z-10">
+        <div className="flex items-center gap-3">
+          <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 shadow-lg" />
+          <h1 className="text-lg sm:text-xl font-bold text-slate-100 tracking-tight">Gemini Sheets Exporter</h1>
+        </div>
+        <div className="flex items-center gap-2 sm:gap-3">
+          <button 
+            onClick={exportToCsv}
+            className="hidden sm:flex items-center gap-2 px-3 py-2 bg-slate-700/80 hover:bg-slate-600 rounded-lg text-white text-sm font-semibold transition-colors duration-200 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed"
+            disabled={messages.length <= 1}
+          >
+            <DownloadIcon className="w-4 h-4" />
+            CSVエクスポート
+          </button>
+          <button
+            onClick={exportToGoogleSheets}
+            className="flex items-center gap-2 px-3 py-2 bg-white text-slate-800 hover:bg-slate-200 rounded-lg text-sm font-semibold transition-colors disabled:bg-slate-600 disabled:text-slate-300 disabled:cursor-not-allowed"
+            disabled={messages.length <= 1 || isExportingSheets}
+            aria-label="Export to Google Sheets"
+            title={isSignedIn ? 'スプレッドシートに保存' : '設定からGoogleアカウントに接続してください'}
+          >
+            <GoogleIcon className="w-4 h-4" />
+            {isExportingSheets ? '保存中…' : 'スプレッドシートに保存'}
+          </button>
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="p-2 rounded-full text-slate-300 hover:bg-slate-700 hover:text-white transition-colors"
+            aria-label="Open settings"
+            title="設定"
+          >
+            <SettingsIcon className="w-6 h-6" />
+          </button>
         </div>
       </header>
-      
+
+      {sheetsStatus && (
+        <div className="px-4 pt-3">
+          <div className="max-w-4xl mx-auto text-sm text-slate-100 bg-slate-800/70 border border-slate-700 rounded-lg px-4 py-2">
+            {sheetsStatus}
+          </div>
+        </div>
+      )}
+
       <main ref={chatContainerRef} className="flex-1 overflow-y-auto p-4">
-        <div className="max-w-4xl mx-auto">
+        <div className="max-w-4xl mx-auto bg-slate-800/30 border border-slate-700/50 rounded-2xl shadow-[0_10px_30px_-15px_rgba(0,0,0,0.7)] p-3 sm:p-4 md:p-6">
           {messages.map((msg, index) => (
             <MessageBubble key={msg.id} message={msg} isTyping={isLoading && index === messages.length -1} />
           ))}
@@ -349,7 +488,7 @@ const App: React.FC = () => {
       )}
 
       <ChatInput onSendMessage={sendMessage} isLoading={isLoading} />
-      
+
       <SettingsModal 
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
@@ -361,6 +500,7 @@ const App: React.FC = () => {
         authError={authError}
         handleSignIn={handleSignIn}
         handleSignOut={handleSignOut}
+        isEnvConfigured={Boolean(ENV_GOOGLE_CLIENT_ID)}
       />
     </div>
   );
