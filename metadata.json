@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Chat Exporter",
+  "description": "Chat with Gemini and export your conversation. Configure your own Google Client ID to enable Google integrations.",
+  "requestFramePermissions": []
+}
